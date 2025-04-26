@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analizador de Series Temporales Financieras</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            color: #333;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1, h2 {
+            color: #2c3e50;
+        }
+        .section {
+            background-color: #f9f9f9;
+            border-radius: 5px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .plot-container {
+            width: 100%;
+            height: 400px;
+            margin: 20px 0;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        input[type="file"] {
+            margin: 10px 0;
+        }
+        .result {
+            background-color: #e8f4fc;
+            padding: 15px;
+            border-left: 4px solid #3498db;
+            margin: 10px 0;
+            border-radius: 0 4px 4px 0;
+        }
+        .tabs {
+            display: flex;
+            margin-bottom: 20px;
+        }
+        .tab {
+            padding: 10px 20px;
+            background-color: #eee;
+            cursor: pointer;
+            margin-right: 5px;
+            border-radius: 5px 5px 0 0;
+        }
+        .tab.active {
+            background-color: #3498db;
+            color: white;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+        }
+        table, th, td {
+            border: 1px solid #ddd;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Analizador de Series Temporales Financieras</h1>
+        
+        <div class="section">
+            <h2>Cargar Datos</h2>
+            <p>Seleccione el período de tiempo y cargue el archivo Excel con los datos:</p>
+            
+            <div>
+                <label for="timePeriod">Período de Tiempo:</label>
+                <select id="timePeriod">
+                    <option value="1M 1D">1 Mes - Datos Diarios</option>
+                    <option value="3M 1D">3 Meses - Datos Diarios</option>
+                </select>
+            </div>
+            
+            <div>
+                <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+                <button id="uploadBtn">Cargar y Analizar</button>
+            </div>
+            
+            <div id="fileInfo"></div>
+        </div>
+        
+        <div class="section">
+            <h2>Resultados del Análisis</h2>
+            
+            <div class="tabs">
+                <div class="tab active" data-tab="stationarity">Pruebas de Estacionariedad</div>
+                <div class="tab" data-tab="arma">Modelos ARMA</div>
+                <div class="tab" data-tab="cointegration">Cointegración</div>
+                <div class="tab" data-tab="plots">Gráficos</div>
+            </div>
+            
+            <div id="stationarity" class="tab-content active">
+                <h3>Pruebas de Estacionariedad (ADF y KPSS)</h3>
+                <div id="stationarityResults"></div>
+            </div>
+            
+            <div id="arma" class="tab-content">
+                <h3>Modelos ARMA Óptimos</h3>
+                <div id="armaResults"></div>
+            </div>
+            
+            <div id="cointegration" class="tab-content">
+                <h3>Prueba de Cointegración de Johansen</h3>
+                <div id="cointegrationResults"></div>
+            </div>
+            
+            <div id="plots" class="tab-content">
+                <h3>Visualización de Datos</h3>
+                <div>
+                    <button id="plotOriginalBtn">Mostrar Precios Originales</button>
+                    <button id="plotDiffBtn">Mostrar Diferencias</button>
+                </div>
+                <div class="plot-container">
+                    <canvas id="timeSeriesChart"></canvas>
+                </div>
+                <div id="plotInterpretation"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Variables globales para almacenar los datos
+        let timeSeriesData = {};
+        let currentTimePeriod = '1M 1D';
+        let chart = null;
+        
+        // Mapeo de columnas según el ticker y período de tiempo
+        const columnMapping = {
+            '1M 1D': {
+                'AMZN': {'date': 'Date', 'close': 'Close'},
+                'COST': {'date': 'Date.1', 'close': 'Close.1'},
+                'AAPL': {'date': 'Date.2', 'close': 'Close.2'}
+            },
+            '3M 1D': {
+                'AMZN': {'date': 'Date', 'close': 'Close'},
+                'COST': {'date': 'Date.1', 'close': 'Close.1'},
+                'AAPL': {'date': 'Date.2', 'close': 'Close.2'}
+            }
+        };
+        const tickers = ['AMZN', 'COST', 'AAPL'];
+        
+        // Configuración de eventos
+        document.getElementById('timePeriod').addEventListener('change', function() {
+            currentTimePeriod = this.value;
+        });
+        
+        document.getElementById('uploadBtn').addEventListener('click', processFile);
+        
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                
+                this.classList.add('active');
+                document.getElementById(this.dataset.tab).classList.add('active');
+            });
+        });
+        
+        document.getElementById('plotOriginalBtn').addEventListener('click', function() {
+            plotTimeSeries(false);
+        });
+        
+        document.getElementById('plotDiffBtn').addEventListener('click', function() {
+            plotTimeSeries(true);
+        });
+        
+        // Función para procesar el archivo cargado
+        async function processFile() {
+            const fileInput = document.getElementById('fileInput');
+            const fileInfo = document.getElementById('fileInfo');
+            
+            if (fileInput.files.length === 0) {
+                alert('Por favor, seleccione un archivo primero.');
+                return;
+            }
+            
+            const file = fileInput.files[0];
+            fileInfo.innerHTML = `<p>Archivo cargado: <strong>${file.name}</strong> (${(file.size / 1024).toFixed(2)} KB)</p>`;
+            
+            try {
+                // Leer el archivo (simplificado para este ejemplo)
+                // En una implementación real, usarías una biblioteca como SheetJS para leer Excel
+                const data = await readFile(file);
+                timeSeriesData = processData(data, currentTimePeriod);
+                
+                // Realizar análisis
+                performStationarityTests();
+                findBestARMA();
+                performCointegrationTest();
+                plotTimeSeries(false);
+                
+            } catch (error) {
+                fileInfo.innerHTML += `<div class="result" style="color:red;">Error al procesar el archivo: ${error.message}</div>`;
+                console.error(error);
+            }
+        }
+        
+        // Función simulada para leer archivos (en un caso real usarías una biblioteca adecuada)
+        function readFile(file) {
+            return new Promise((resolve, reject) => {
+                if (file.name.endsWith('.csv')) {
+                    const
