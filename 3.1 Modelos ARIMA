@@ -1,0 +1,455 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from scipy import stats
+import warnings
+import os
+from scipy.fft import fft
+from sklearn.metrics import mean_squared_error
+warnings.filterwarnings('ignore')
+
+class StockAnalyzer:
+    def __init__(self, ticker):
+        self.data = None
+        self.ticker = ticker
+        self.forecast_arima = None
+        self.forecast_tes = None
+        self.trend = None
+        self.conclusion = ""
+        self.recommendation = ""
+        self.period = None
+
+    def load_excel_manually(self, company_name):
+        """Carga interactiva del archivo Excel para la acción especificada"""
+        print(f"\nANÁLISIS DE ACCIONES - PREDICCIÓN DE TENDENCIA (5M 1D) - {company_name.upper()} ({self.ticker})")
+        print("="*60)
+
+        # Método para Colab
+        if 'google.colab' in str(get_ipython()):
+            from google.colab import files
+            print(f"\nPor favor suba su archivo Excel para {company_name} (ej: {self.ticker.lower()}_5m.xlsx)")
+            uploaded = files.upload()
+            return next(iter(uploaded)) if uploaded else None
+
+        # Método para Jupyter/Consola con GUI
+        try:
+            from tkinter import Tk
+            from tkinter.filedialog import askopenfilename
+            Tk().withdraw()
+            print(f"\nPor favor seleccione su archivo Excel para {company_name}")
+            return askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
+
+        # Método para consola sin GUI
+        except:
+            print(f"\nIngrese la ruta completa de su archivo Excel para {company_name}:")
+            print(f"Ejemplo: C:/Users/MiUsuario/Downloads/{self.ticker.lower()}_5m.xlsx")
+            return input("Ruta del archivo: ").strip('"\' ')
+
+    def process_data(self, file_path):
+        """Procesa el archivo Excel con manejo robusto de errores"""
+        try:
+            # Cargar archivo Excel
+            df = pd.read_excel(file_path)
+
+            # Detección robusta de columnas
+            date_col = next((col for col in df.columns if 'fecha' in col.lower() or 'date' in col.lower()), None)
+            price_col = next((col for col in df.columns if 'precio' in col.lower() or 'close' in col.lower()), None)
+
+            if date_col is None or price_col is None:
+                print("\n✗ No se encontraron columnas de fecha o precio. Usando primeras columnas.")
+                date_col, price_col = df.columns[0], df.columns[-1]
+
+            # Crear serie temporal con manejo de fechas
+            try:
+                self.data = pd.Series(
+                    pd.to_numeric(df[price_col], errors='coerce').values,
+                    index=pd.to_datetime(df[date_col]),
+                    name=f'{self.ticker} (5M 1D)'
+                ).dropna()
+
+                # Verificar que tenemos suficientes datos
+                if len(self.data) < 30:
+                    raise ValueError("Insuficientes datos (mínimo 30 registros requeridos)")
+
+                print(f"\n✓ Datos cargados correctamente: {len(self.data)} registros de {self.ticker}")
+                return True
+
+            except Exception as e:
+                print(f"\n✗ Error al procesar series temporales: {str(e)}")
+                return False
+
+        except Exception as e:
+            print(f"\n✗ Error al cargar el archivo: {str(e)}")
+            return False
+
+    def fft_analysis(self):
+        """Análisis de frecuencia para detectar estacionalidad"""
+        try:
+            print("\n🔍 ANÁLISIS DE FRECUENCIA (FFT):")
+            if len(self.data) < 10:
+                raise ValueError("Insuficientes datos para análisis FFT")
+
+            # Calcular FFT
+            y = self.data.values
+            n = len(y)
+            yf = fft(y)
+            power = np.abs(yf[:n//2])**2
+            freq = np.fft.fftfreq(n, d=5/60)[:n//2]  # Frecuencias en horas (5 minutos = 5/60 horas)
+
+            # Encontrar el período dominante
+            idx = np.argmax(power[1:]) + 1  # Ignorar frecuencia 0
+            period_hours = 1 / freq[idx]  # Período en horas
+            period_points = int(period_hours * 12)  # Período en puntos (12 puntos por hora)
+
+            if period_points < len(self.data):
+                self.period = period_points
+                print(f"Período detectado: {period_hours:.2f} horas ({self.period} puntos)")
+            else:
+                self.period = None
+                print("No se detectó estacionalidad clara")
+
+        except Exception as e:
+            print(f"\n✗ Error en análisis FFT: {str(e)}")
+            self.period = None
+
+    def run_sequence_plot(self, time, y, title, ax):
+        """Función personalizada para gráficos de series temporales"""
+        ax.plot(time, y, 'b-', lw=1.5)
+        ax.set_title(title)
+        ax.set_xlabel("Fecha")
+        ax.set_ylabel("Precio")
+        ax.grid(True, linestyle='--', alpha=0.7)
+        return ax
+
+    def plot_data(self):
+        """Visualización de los datos con manejo seguro de índices"""
+        try:
+            fig, ax = plt.subplots(figsize=(14, 6))
+
+            # Verificar que tenemos datos para graficar
+            if len(self.data) == 0:
+                raise ValueError("No hay datos para graficar")
+
+            self.run_sequence_plot(self.data.index, self.data, f"Serie Temporal de {self.ticker}", ax)
+
+            # Calcular media móvil solo si hay suficientes datos
+            if len(self.data) >= 20:
+                rolling_mean = self.data.rolling(window=20).mean()
+                ax.plot(rolling_mean, 'r-', label='Media 20 periodos')
+
+            ax.legend()
+            plt.show()
+
+        except Exception as e:
+            print(f"\n✗ Error al graficar datos: {str(e)}")
+
+    def stationarity_test(self):
+        """Prueba de estacionariedad con manejo de errores"""
+        try:
+            print("\n🔍 PRUEBA DE ESTACIONARIEDAD:")
+
+            # Verificar que tenemos datos suficientes
+            if len(self.data) < 10:
+                raise ValueError("Insuficientes datos para prueba de estacionariedad")
+
+            result = adfuller(self.data.dropna())
+            print(f"ADF Statistic: {result[0]:.4f}")
+            print(f"p-value: {result[1]:.4f}")
+
+            if result[1] <= 0.05:
+                print("Conclusión: Serie ESTACIONARIA (p ≤ 0.05)")
+            else:
+                print("Conclusión: Serie NO ESTACIONARIA (p > 0.05)")
+
+                # Diferenciación de primer orden
+                diff_data = self.data.diff().dropna()
+                if len(diff_data) >= 10:
+                    result_diff = adfuller(diff_data)
+                    print(f"\nDiferenciación de 1er orden - p-value: {result_diff[1]:.4f}")
+                    if result_diff[1] <= 0.05:
+                        print("Conclusión: Serie diferenciada ES ESTACIONARIA")
+
+        except Exception as e:
+            print(f"\n✗ Error en prueba de estacionariedad: {str(e)}")
+
+    def plot_acf_pacf(self):
+        """Autocorrelación con manejo de errores"""
+        try:
+            diff_data = self.data.diff().dropna()
+            if len(diff_data) < 10:
+                raise ValueError("Insuficientes datos después de diferenciación")
+
+            fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+            plot_acf(self.data, lags=min(20, len(self.data)//2), ax=axes[0, 0],
+                    title=f'ACF para {self.ticker} (Original)')
+            plot_pacf(self.data, lags=min(20, len(self.data)//2), ax=axes[0, 1],
+                    title=f'PACF para {self.ticker} (Original)')
+            plot_acf(diff_data, lags=min(20, len(diff_data)//2), ax=axes[1, 0],
+                    title=f'ACF para {self.ticker} (Diferenciada)')
+            plot_pacf(diff_data, lags=min(20, len(diff_data)//2), ax=axes[1, 1],
+                    title=f'PACF para {self.ticker} (Diferenciada)')
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            print(f"\n✗ Error al graficar ACF/PACF: {str(e)}")
+
+    def fit_arima_model(self, p=1, d=1, q=1):
+        """Ajuste robusto del modelo ARIMA"""
+        try:
+            print("\n🤖 MODELO ARIMA Y PRONÓSTICO:")
+
+            if len(self.data) < 30:
+                raise ValueError("Se requieren al menos 30 registros para modelado ARIMA")
+
+            train_size = max(int(len(self.data) * 0.8), len(self.data) - 10)
+            train = self.data[:train_size]
+            test = self.data[train_size:]
+
+            # Ajustar modelo ARIMA
+            try:
+                model = ARIMA(train, order=(p, d, q))
+                results = model.fit()
+                print(results.summary())
+            except:
+                print("Fallo con parámetros iniciales, intentando con modelo más simple")
+                model = ARIMA(train, order=(1, 1, 0))
+                results = model.fit()
+                print(results.summary())
+
+            # Pronóstico
+            forecast_steps = min(10, len(test))
+            forecast_obj = results.get_forecast(steps=forecast_steps)
+            self.forecast_arima = forecast_obj.predicted_mean
+
+            # Calcular MSE
+            if len(test) >= forecast_steps:
+                mse_arima = mean_squared_error(test[:forecast_steps], self.forecast_arima)
+                print(f"MSE ARIMA: {mse_arima:.2f}")
+
+            # Calcular tendencia
+            if len(self.forecast_arima) > 1:
+                x = np.arange(len(self.forecast_arima))
+                slope, _, _, _, _ = stats.linregress(x, self.forecast_arima)
+                self.trend = 'ALCISTA' if slope > 0 else 'BAJISTA'
+                print(f"\n📈 Pronóstico ARIMA para {forecast_steps} períodos:")
+                print(self.forecast_arima)
+                print(f"Tendencia detectada: {self.trend} (pendiente: {slope:.6f})")
+            else:
+                self.trend = 'NEUTRA'
+                print("\nNo se pudo determinar tendencia por insuficientes puntos de pronóstico")
+
+        except Exception as e:
+            print(f"\n✗ Error en modelado ARIMA: {str(e)}")
+            self.trend = 'INDETERMINADA'
+
+    def fit_tes_model(self):
+        """Ajuste de modelo de Suavizado Exponencial Triple (TES) con ARIMA en residuos"""
+        try:
+            print("\n🤖 MODELO TES + ARIMA Y PRONÓSTICO:")
+
+            if len(self.data) < 30:
+                raise ValueError("Se requieren al menos 30 registros para modelado TES")
+
+            train_size = max(int(len(self.data) * 0.8), len(self.data) - 10)
+            train = self.data[:train_size]
+            test = self.data[train_size:]
+
+            # Ajustar modelo TES
+            period = self.period if self.period else 12  # Default a 1 hora (12 puntos)
+            if period >= len(train):
+                period = max(2, len(train) // 2)
+
+            tes_model = ExponentialSmoothing(
+                train, trend='add', seasonal='add', seasonal_periods=period
+            ).fit(smoothing_level=0.01)
+            trend_and_seasonality = tes_model.fittedvalues
+            tes_resid = train - trend_and_seasonality
+
+            # Ajustar ARIMA a los residuos
+            resid_model = ARIMA(tes_resid, order=(2, 0, 0))
+            resid_results = resid_model.fit()
+
+            # Pronóstico
+            forecast_steps = min(10, len(test))
+            tes_pred = tes_model.forecast(forecast_steps)
+            resid_pred = resid_results.forecast(steps=forecast_steps)
+            self.forecast_tes = tes_pred + resid_pred
+
+            # Calcular MSE
+            if len(test) >= forecast_steps:
+                mse_tes = mean_squared_error(test[:forecast_steps], self.forecast_tes)
+                print(f"MSE TES+ARIMA: {mse_tes:.2f}")
+
+            # Graficar residuos
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            plot_acf(tes_resid, ax=axes[0], title=f'ACF Residuos TES - {self.ticker}')
+            plot_pacf(tes_resid, ax=axes[1], title=f'PACF Residuos TES - {self.ticker}')
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            print(f"\n✗ Error en modelado TES: {str(e)}")
+            self.forecast_tes = None
+
+    def determine_trend(self):
+        """Determina la tendencia con lógica robusta"""
+        try:
+            if not hasattr(self, 'trend') or self.trend == 'INDETERMINADA':
+                self.conclusion = "TENDENCIA INDETERMINADA ⚠️"
+                self.recommendation = "ANÁLISIS NO CONCLUYENTE"
+                return
+
+            current_price = self.data.iloc[-1]
+            ma_20 = self.data.rolling(window=min(20, len(self.data))).mean().iloc[-1] if len(self.data) >= 20 else current_price
+
+            # Usar el pronóstico más preciso (menor MSE)
+            forecast = self.forecast_arima
+            if self.forecast_tes is not None and len(self.data) >= len(self.forecast_tes):
+                mse_arima = mean_squared_error(self.data[-len(self.forecast_arima):], self.forecast_arima) if len(self.forecast_arima) <= len(self.data) else float('inf')
+                mse_tes = mean_squared_error(self.data[-len(self.forecast_tes):], self.forecast_tes) if len(self.forecast_tes) <= len(self.data) else float('inf')
+                if mse_tes < mse_arima:
+                    forecast = self.forecast_tes
+
+            trend_strength = 0.0
+            if len(forecast) > 1:
+                trend_strength = abs(forecast[-1] - forecast[0]) / forecast[0]
+
+            if self.trend == 'ALCISTA':
+                if current_price > ma_20 and trend_strength > 0.005:
+                    self.conclusion = "FUERTE TENDENCIA ALCISTA 📈"
+                    self.recommendation = "COMPRA o MANTÉN"
+                else:
+                    self.conclusion = "TENDENCIA ALCISTA MODERADA ↗️"
+                    self.recommendation = "CONSIDERA COMPRA"
+            elif self.trend == 'BAJISTA':
+                if current_price < ma_20 and trend_strength > 0.005:
+                    self.conclusion = "FUERTE TENDENCIA BAJISTA 📉"
+                    self.recommendation = "VENDE o EVITA"
+                else:
+                    self.conclusion = "TENDENCIA BAJISTA MODERADA ↘️"
+                    self.recommendation = "CONSIDERA VENTA"
+            else:
+                self.conclusion = "TENDENCIA NEUTRA O INDECISA ↔️"
+                self.recommendation = "ESPERA CONFIRMACIÓN"
+
+        except Exception as e:
+            print(f"\n⚠️ Error al determinar tendencia: {str(e)}")
+            self.conclusion = "TENDENCIA INDETERMINADA ⚠️"
+            self.recommendation = "ANÁLISIS NO CONCLUYENTE"
+
+    def display_conclusion(self):
+        """Muestra la conclusión final con gráfico"""
+        try:
+            print("\n" + "="*60)
+            print("🎯 CONCLUSIÓN FINAL Y RECOMENDACIÓN")
+            print("="*60)
+            print(f"\nAcción analizada: {self.ticker}")
+            print(f"Último precio: {self.data.iloc[-1]:.2f}")
+
+            if len(self.data) >= 20:
+                print(f"Media móvil (20): {self.data.rolling(window=20).mean().iloc[-1]:.2f}")
+
+            print(f"\nTendencia detectada: {self.conclusion}")
+            print(f"RECOMENDACIÓN: {self.recommendation}")
+
+            # Gráfico final con ambos pronósticos
+            fig, ax = plt.subplots(figsize=(14, 7))
+            self.run_sequence_plot(self.data.index, self.data, f"PRONÓSTICO PARA {self.ticker}", ax)
+
+            forecast_steps = min(10, len(self.data) - int(len(self.data) * 0.8))
+            forecast_index = pd.date_range(
+                start=self.data.index[-1],
+                periods=forecast_steps+1,
+                freq='5min'
+            )[1:]
+
+            if self.forecast_arima is not None:
+                ax.plot(forecast_index, self.forecast_arima, 'r--', label='Pronóstico ARIMA')
+
+            if self.forecast_tes is not None:
+                ax.plot(forecast_index, self.forecast_tes, 'g--', label='Pronóstico TES+ARIMA')
+
+            ax.legend()
+            plt.show()
+
+        except Exception as e:
+            print(f"\n⚠️ Error al mostrar conclusión: {str(e)}")
+
+    def full_analysis(self, company_name):
+        """Ejecuta el análisis completo para una acción"""
+        try:
+            # 1. Carga de datos
+            file_path = self.load_excel_manually(company_name)
+            if not file_path or not os.path.exists(file_path):
+                print(f"\n✗ No se pudo cargar el archivo para {company_name}. Pasando a la siguiente acción.")
+                return False
+
+            if not self.process_data(file_path):
+                print(f"\n✗ Error al procesar datos para {company_name}. Pasando a la siguiente acción.")
+                return False
+
+            # 2. Análisis básico
+            print("\n" + "="*60)
+            print(f"📊 ANÁLISIS TÉCNICO PARA {self.ticker}")
+            print("="*60)
+
+            self.plot_data()
+            self.stationarity_test()
+            self.fft_analysis()
+
+            # 3. Análisis avanzado
+            self.plot_acf_pacf()
+            self.fit_arima_model()
+            self.fit_tes_model()
+
+            # 4. Conclusión de tendencia
+            self.determine_trend()
+            self.display_conclusion()
+
+            return True
+
+        except Exception as e:
+            print(f"\n⚠️ ERROR DURANTE EL ANÁLISIS DE {company_name}: {str(e)}")
+            print("\nPosibles soluciones:")
+            print("1. Verifique que el archivo tenga al menos 30 registros")
+            print("2. Asegúrese que las columnas de fecha y precio son válidas")
+            print("3. Intente con un archivo diferente")
+            return False
+
+def analyze_all_stocks():
+    """Analiza las 6 acciones de manera secuencial"""
+    # Lista de acciones con ticker y nombre completo
+    stocks = [
+        {"ticker": "MRNA", "name": "Moderna"},
+        {"ticker": "SMCI", "name": "Super Micro Computer"},
+        {"ticker": "COST", "name": "Costco"},
+        {"ticker": "AAPL", "name": "Apple"},
+        {"ticker": "TSLA", "name": "Tesla"},
+        {"ticker": "NVDA", "name": "NVIDIA"}
+    ]
+
+    print("\n" + "="*60)
+    print("📈 ANÁLISIS DE 6 ACCIONES - PREDICCIÓN DE TENDENCIA (5M 1D)")
+    print("="*60)
+
+    for stock in stocks:
+        print(f"\n📌 INICIANDO ANÁLISIS PARA {stock['name']} ({stock['ticker']})")
+        analyzer = StockAnalyzer(stock['ticker'])
+        success = analyzer.full_analysis(stock['name'])
+        if success:
+            print(f"\n✓ Análisis completado para {stock['name']} ({stock['ticker']})")
+        else:
+            print(f"\n✗ Análisis fallido para {stock['name']} ({stock['ticker']})")
+        print("\n" + "-"*60)
+
+    print("\n" + "="*60)
+    print("🏁 ANÁLISIS COMPLETO FINALIZADO PARA TODAS LAS ACCIONES")
+    print("="*60)
+
+if __name__ == "__main__":
+    analyze_all_stocks()
