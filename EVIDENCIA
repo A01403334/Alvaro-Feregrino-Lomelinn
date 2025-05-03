@@ -1,0 +1,590 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.stattools import adfuller, coint
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from sklearn.metrics import mean_squared_error
+from scipy import stats
+import warnings
+from google.colab import files
+warnings.filterwarnings('ignore')
+
+class StockAnalyzer:
+    def __init__(self, ticker):
+        self.data = None
+        self.ticker = ticker
+        self.forecast_ar = None
+        self.forecast_arma = None
+        self.forecast_arima = None
+        self.trend = None
+        self.conclusion = ""
+        self.recommendation = ""
+        self.best_model = ""
+        self.best_mse = float('inf')
+        self.trend_strength = 0.0
+        self.is_stationary = False
+        self.slope = 0.0
+        self.support_level = None
+        self.stop_loss = None
+        self.risk_note = ""
+        
+    def load_excel_manually(self, company_name):
+        """Carga interactiva del archivo Excel en Google Colab"""
+        print(f"\nANÁLISIS DE ACCIONES - PREDICCIÓN DE TENDENCIA (5M 1D) - {company_name.upper()} ({self.ticker})")
+        print("="*60)
+        
+        print(f"\nPor favor suba su archivo Excel para {company_name} (ej: {self.ticker.lower()}_5m.xlsx)")
+        uploaded = files.upload()
+        file_path = next(iter(uploaded)) if uploaded else None
+        return file_path
+    
+    def process_data(self, file_path):
+        """Procesa el archivo Excel con manejo robusto de errores"""
+        try:
+            df = pd.read_excel(file_path)
+            
+            date_col = next((col for col in df.columns if 'fecha' in col.lower() or 'date' in col.lower()), None)
+            price_col = next((col for col in df.columns if 'precio' in col.lower() or 'close' in col.lower()), None)
+            
+            if date_col is None or price_col is None:
+                print("\n✗ No se encontraron columnas de fecha o precio. Usando primeras columnas.")
+                date_col, price_col = df.columns[0], df.columns[-1]
+            
+            self.data = pd.Series(
+                pd.to_numeric(df[price_col], errors='coerce').values,
+                index=pd.to_datetime(df[date_col]),
+                name=f'{self.ticker} (5M 1D)'
+            ).dropna()
+            
+            if len(self.data) < 30:
+                raise ValueError("Insuficientes datos (mínimo 30 registros requeridos)")
+            
+            print(f"\n✓ Datos cargados correctamente: {len(self.data)} registros de {self.ticker}")
+            return True
+            
+        except Exception as e:
+            print(f"\n✗ Error al procesar datos: {str(e)}")
+            return False
+    
+    def unit_root_test(self):
+        """Prueba de raíz unitaria (ADF)"""
+        try:
+            print("\n🔍 PRUEBA DE RAÍZ UNITARIA (ADF):")
+            if len(self.data) < 10:
+                raise ValueError("Insuficientes datos para prueba ADF")
+            
+            result = adfuller(self.data.dropna())
+            print(f"ADF Statistic: {result[0]:.4f}")
+            print(f"p-value: {result[1]:.4f}")
+            
+            if result[1] <= 0.05:
+                print("Conclusión: Serie ESTACIONARIA (p ≤ 0.05)")
+                self.is_stationary = True
+            else:
+                print("Conclusión: Serie NO ESTACIONARIA (p > 0.05)")
+                diff_data = self.data.diff().dropna()
+                if len(diff_data) >= 10:
+                    result_diff = adfuller(diff_data)
+                    print(f"\nDiferenciación de 1er orden - p-value: {result_diff[1]:.4f}")
+                    if result_diff[1] <= 0.05:
+                        print("Conclusión: Serie diferenciada ES ESTACIONARIA")
+                        self.is_stationary = True
+                    else:
+                        self.is_stationary = False
+                    
+        except Exception as e:
+            print(f"\n✗ Error en prueba ADF: {str(e)}")
+            self.is_stationary = False
+    
+    def plot_data(self):
+        """Gráfico de la serie temporal con media móvil"""
+        try:
+            fig, ax = plt.subplots(figsize=(14, 6))
+            ax.plot(self.data.index, self.data, 'b-', lw=1.5, label='Precio')
+            ax.set_title(f"Serie Temporal de {self.ticker}")
+            ax.set_xlabel("Fecha")
+            ax.set_ylabel("Precio")
+            ax.grid(True, linestyle='--', alpha=0.7)
+            
+            if len(self.data) >= 20:
+                rolling_mean = self.data.rolling(window=20).mean()
+                ax.plot(rolling_mean, 'r-', label='Media 20 periodos')
+            
+            ax.legend()
+            plt.show()
+            
+        except Exception as e:
+            print(f"\n✗ Error al graficar datos: {str(e)}")
+    
+    def plot_acf_pacf(self):
+        """Gráficos ACF y PACF"""
+        try:
+            diff_data = self.data.diff().dropna()
+            if len(diff_data) < 10:
+                raise ValueError("Insuficientes datos después de diferenciación")
+            
+            fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+            plot_acf(self.data, lags=min(20, len(self.data)//2), ax=axes[0, 0], 
+                    title=f'ACF para {self.ticker} (Original)')
+            plot_pacf(self.data, lags=min(20, len(self.data)//2), ax=axes[0, 1], 
+                    title=f'PACF para {self.ticker} (Original)')
+            plot_acf(diff_data, lags=min(20, len(diff_data)//2), ax=axes[1, 0], 
+                    title=f'ACF para {self.ticker} (Diferenciada)')
+            plot_pacf(diff_data, lags=min(20, len(diff_data)//2), ax=axes[1, 1], 
+                    title=f'PACF para {self.ticker} (Diferenciada)')
+            plt.tight_layout()
+            plt.show()
+            
+        except Exception as e:
+            print(f"\n✗ Error al graficar ACF/PACF: {str(e)}")
+    
+    def fit_models(self):
+        """Ajustar modelos AR, ARMA y ARIMA"""
+        try:
+            print("\n🤖 MODELOS AR, ARMA Y ARIMA:")
+            if len(self.data) < 30:
+                raise ValueError("Se requieren al menos 30 registros para modelado")
+            
+            train_size = max(int(len(self.data) * 0.8), len(self.data) - 10)
+            train = self.data[:train_size]
+            test = self.data[train_size:]
+            forecast_steps = min(10, len(test))
+            
+            # Modelo AR
+            try:
+                ar_model = ARIMA(train, order=(1, 0, 0)).fit()
+                self.forecast_ar = ar_model.forecast(steps=forecast_steps)
+                mse_ar = mean_squared_error(test[:forecast_steps], self.forecast_ar) if len(test) >= forecast_steps else float('inf')
+                print(f"\nModelo AR - MSE: {mse_ar:.2f}")
+                print(self.forecast_ar)
+            except:
+                print("\n✗ Error en modelo AR")
+                mse_ar = float('inf')
+            
+            # Modelo ARMA
+            try:
+                arma_model = ARIMA(train, order=(1, 0, 1)).fit()
+                self.forecast_arma = arma_model.forecast(steps=forecast_steps)
+                mse_arma = mean_squared_error(test[:forecast_steps], self.forecast_arma) if len(test) >= forecast_steps else float('inf')
+                print(f"\nModelo ARMA - MSE: {mse_arma:.2f}")
+                print(self.forecast_arma)
+            except:
+                print("\n✗ Error en modelo ARMA")
+                mse_arma = float('inf')
+            
+            # Modelo ARIMA
+            try:
+                arima_model = ARIMA(train, order=(1, 1, 1)).fit()
+                self.forecast_arima = arima_model.forecast(steps=forecast_steps)
+                mse_arima = mean_squared_error(test[:forecast_steps], self.forecast_arima) if len(test) >= forecast_steps else float('inf')
+                print(f"\nModelo ARIMA - MSE: {mse_arima:.2f}")
+                print(self.forecast_arima)
+            except:
+                print("\n✗ Error en modelo ARIMA")
+                mse_arima = float('inf')
+            
+            # Seleccionar mejor modelo y determinar tendencia
+            forecasts = [
+                (self.forecast_ar, mse_ar, "AR"),
+                (self.forecast_arma, mse_arma, "ARMA"),
+                (self.forecast_arima, mse_arima, "ARIMA")
+            ]
+            valid_forecasts = [(f, mse, name) for f, mse, name in forecasts if f is not None and np.isfinite(mse)]
+            
+            if valid_forecasts:
+                best_forecast, self.best_mse, self.best_model = min(valid_forecasts, key=lambda x: x[1])
+                if len(best_forecast) > 1:
+                    x = np.arange(len(best_forecast))
+                    self.slope, _, _, _, _ = stats.linregress(x, best_forecast)
+                    self.trend_strength = abs(best_forecast[-1] - best_forecast[0]) / best_forecast[0]
+                    if abs(self.slope) < 0.0001:
+                        self.trend = 'NEUTRA'
+                    else:
+                        self.trend = 'ALCISTA' if self.slope > 0 else 'BAJISTA'
+                    print(f"\nMejor modelo: {self.best_model} (MSE: {self.best_mse:.2f})")
+                    print(f"Tendencia detectada: {self.trend} (pendiente: {self.slope:.6f})")
+                    print(f"Fuerza de tendencia: {self.trend_strength*100:.2f}%")
+                else:
+                    self.trend = 'NEUTRA'
+                    print("\nNo se pudo determinar tendencia")
+            else:
+                self.trend = 'INDETERMINADA'
+                print("\nNo se encontraron modelos válidos")
+                
+        except Exception as e:
+            print(f"\n✗ Error en modelado: {str(e)}")
+            self.trend = 'INDETERMINADA'
+    
+    def determine_trend(self):
+        """Determinar recomendación basada en la tendencia y niveles específicos"""
+        try:
+            current_price = self.data.iloc[-1]
+            ma_20 = self.data.rolling(window=min(20, len(self.data))).mean().iloc[-1] if len(self.data) >= 20 else current_price
+            
+            # Configuración específica por acción
+            if self.ticker == 'MRNA':
+                self.support_level = 27.20
+                self.stop_loss = 27.50
+                self.risk_note = "Alta volatilidad por noticias biotecnológicas (ej: ensayos clínicos)."
+            elif self.ticker == 'COST':
+                self.support_level = 976.00
+                self.stop_loss = 985.00
+                self.risk_note = "Posibles rebotes por compras institucionales."
+            elif self.ticker == 'NVDA':
+                self.support_level = 110.00  # Resistencia en este caso
+                self.stop_loss = 112.00
+                self.risk_note = "Posible repunte por sector tecnológico (IA)."
+            
+            if self.trend == 'INDETERMINADA':
+                self.conclusion = "TENDENCIA INDETERMINADA ⚠️"
+                self.recommendation = "ANÁLISIS NO CONCLUYENTE - ESPERA"
+                return
+            
+            best_forecast = None
+            if self.best_model == "AR" and self.forecast_ar is not None:
+                best_forecast = self.forecast_ar
+            elif self.best_model == "ARMA" and self.forecast_arma is not None:
+                best_forecast = self.forecast_arma
+            elif self.best_model == "ARIMA" and self.forecast_arima is not None:
+                best_forecast = self.forecast_arima
+            
+            if self.ticker == 'MRNA':
+                if self.trend == 'BAJISTA' and current_price <= self.support_level and current_price < ma_20:
+                    self.conclusion = f"FUERTE TENDENCIA BAJISTA 📉 (Modelo: {self.best_model})"
+                    self.recommendation = f"SHORT SALE - VENTA CORTA (Entrada: ${current_price:.2f}, Stop-loss: ${self.stop_loss:.2f})"
+                elif self.trend == 'BAJISTA':
+                    self.conclusion = f"TENDENCIA BAJISTA MODERADA ↘️ (Modelo: {self.best_model})"
+                    self.recommendation = f"CONSIDERA SHORT SALE si rompe ${self.support_level:.2f} (Stop-loss: ${self.stop_loss:.2f})"
+                elif self.trend == 'ALCISTA':
+                    self.conclusion = f"TENDENCIA ALCISTA ↗️ (Modelo: {self.best_model})"
+                    self.recommendation = "CONSIDERA COMPRA, pero cuidado con volatilidad"
+                else:
+                    self.conclusion = f"TENDENCIA NEUTRA ↔️ (Modelo: {self.best_model})"
+                    self.recommendation = "ESPERA - NO ACTÚES HASTA CONFIRMACIÓN"
+            
+            elif self.ticker == 'COST':
+                if self.trend == 'BAJISTA' and current_price <= self.support_level and current_price < ma_20:
+                    self.conclusion = f"FUERTE TENDENCIA BAJISTA 📉 (Modelo: {self.best_model})"
+                    self.recommendation = f"SHORT SALE - VENTA CORTA (Entrada: ${current_price:.2f}, Stop-loss: ${self.stop_loss:.2f})"
+                elif self.trend == 'BAJISTA':
+                    self.conclusion = f"TENDENCIA BAJISTA MODERADA ↘️ (Modelo: {self.best_model})"
+                    self.recommendation = f"CONSIDERA SHORT SALE si rompe ${self.support_level:.2f} (Stop-loss: ${self.stop_loss:.2f})"
+                elif self.trend == 'ALCISTA':
+                    self.conclusion = f"TENDENCIA ALCISTA ↗️ (Modelo: {self.best_model})"
+                    self.recommendation = "CONSIDERA COMPRA, pero cuidado con rebotes institucionales"
+                else:
+                    self.conclusion = f"TENDENCIA NEUTRA ↔️ (Modelo: {self.best_model})"
+                    self.recommendation = "ESPERA - NO ACTÚES HASTA CONFIRMACIÓN"
+            
+            elif self.ticker == 'NVDA':
+                if self.trend == 'BAJISTA' and current_price >= self.support_level:  # Resistencia
+                    self.conclusion = f"TENDENCIA BAJISTA CONDICIONAL 📉 (Modelo: {self.best_model})"
+                    self.recommendation = f"CONSIDERA SHORT SALE si rechaza ${self.support_level:.2f} con volumen alto (Stop-loss: ${self.stop_loss:.2f})"
+                elif self.trend == 'ALCISTA':
+                    self.conclusion = f"TENDENCIA ALCISTA DÉBIL ↗️ (Modelo: {self.best_model})"
+                    self.recommendation = "CONSIDERA COMPRA, pero cuidado con resistencia en $110"
+                else:
+                    self.conclusion = f"TENDENCIA NEUTRA ↔️ (Modelo: {self.best_model})"
+                    self.recommendation = "ESPERA - NO ACTÚES HASTA CONFIRMACIÓN"
+                
+        except Exception as e:
+            print(f"\n⚠️ Error al determinar tendencia: {str(e)}")
+            self.conclusion = "TENDENCIA INDETERMINADA ⚠️"
+            self.recommendation = "ANÁLISIS NO CONCLUYENTE - ESPERA"
+    
+    def display_conclusion(self):
+        """Mostrar conclusión y gráfico de pronósticos"""
+        try:
+            print("\n" + "="*60)
+            print("🎯 CONCLUSIÓN FINAL Y RECOMENDACIÓN")
+            print("="*60)
+            print(f"\nAcción analizada: {self.ticker}")
+            print(f"Último precio: {self.data.iloc[-1]:.2f}")
+            
+            if len(self.data) >= 20:
+                print(f"Media móvil (20): {self.data.rolling(window=20).mean().iloc[-1]:.2f}")
+            
+            if self.support_level:
+                print(f"Nivel clave: ${self.support_level:.2f} {'(Soporte)' if self.ticker != 'NVDA' else '(Resistencia)'}")
+            if self.stop_loss:
+                print(f"Stop-loss: ${self.stop_loss:.2f}")
+            if self.risk_note:
+                print(f"Riesgo: {self.risk_note}")
+            
+            print(f"\nTendencia detectada: {self.conclusion}")
+            print(f"RECOMENDACIÓN: {self.recommendation}")
+            
+            fig, ax = plt.subplots(figsize=(14, 7))
+            ax.plot(self.data.index, self.data, 'b-', label='Precio', lw=1.5)
+            ax.set_title(f"PRONÓSTICO PARA {self.ticker} - {self.conclusion}")
+            ax.set_xlabel("Fecha")
+            ax.set_ylabel("Precio")
+            ax.grid(True, linestyle='--', alpha=0.7)
+            
+            forecast_steps = min(10, len(self.data) - int(len(self.data) * 0.8))
+            forecast_index = pd.date_range(
+                start=self.data.index[-1], 
+                periods=forecast_steps+1, 
+                freq='5min'
+            )[1:]
+            
+            if self.forecast_ar is not None:
+                ax.plot(forecast_index, self.forecast_ar, 'r--', label='Pronóstico AR')
+            if self.forecast_arma is not None:
+                ax.plot(forecast_index, self.forecast_arma, 'g--', label='Pronóstico ARMA')
+            if self.forecast_arima is not None:
+                ax.plot(forecast_index, self.forecast_arima, 'purple', label='Pronóstico ARIMA')
+            
+            ax.annotate(
+                f"Recomendación: {self.recommendation}\nRiesgo: {self.risk_note}",
+                xy=(0.05, 0.95), xycoords='axes fraction',
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", lw=1),
+                fontsize=10
+            )
+            
+            ax.legend()
+            plt.show()
+            
+        except Exception as e:
+            print(f"\n⚠️ Error al mostrar conclusión: {str(e)}")
+    
+    def full_analysis(self, company_name):
+        """Ejecutar análisis completo para una acción"""
+        try:
+            file_path = self.load_excel_manually(company_name)
+            if not file_path:
+                print(f"\n✗ No se pudo cargar el archivo para {company_name}. Pasando a la siguiente acción.")
+                return False
+            
+            if not self.process_data(file_path):
+                print(f"\n✗ Error al procesar datos para {company_name}. Pasando a la siguiente acción.")
+                return False
+            
+            print("\n" + "="*60)
+            print(f"📊 ANÁLISIS TÉCNICO PARA {self.ticker}")
+            print("="*60)
+            
+            self.plot_data()
+            self.unit_root_test()
+            self.plot_acf_pacf()
+            self.fit_models()
+            self.determine_trend()
+            self.display_conclusion()
+            
+            return True
+            
+        except Exception as e:
+            print(f"\n⚠️ ERROR DURANTE EL ANÁLISIS DE {company_name}: {str(e)}")
+            print("\nPosibles soluciones:")
+            print("1. Verifique que el archivo tenga al menos 30 registros")
+            print("2. Asegúrese que las columnas de fecha y precio son válidas")
+            print("3. Intente con un archivo diferente")
+            return False
+
+def cointegration_test(data_dict):
+    """Prueba de cointegración entre pares de acciones"""
+    cointegration_results = []
+    print("\n🔍 PRUEBA DE COINTEGRACIÓN (ENGLE-GRANGER):")
+    pairs = [
+        ("COST", "MRNA"),
+        ("COST", "NVDA"),
+        ("MRNA", "NVDA")
+    ]
+    
+    for stock1, stock2 in pairs:
+        try:
+            if stock1 in data_dict and stock2 in data_dict:
+                common_index = data_dict[stock1].index.intersection(data_dict[stock2].index)
+                if len(common_index) < 30:
+                    print(f"\n✗ Insuficientes datos comunes para {stock1} y {stock2}")
+                    cointegration_results.append((stock1, stock2, False, None))
+                    continue
+                
+                s1 = data_dict[stock1].loc[common_index]
+                s2 = data_dict[stock2].loc[common_index]
+                
+                score, p_value, _ = coint(s1, s2)
+                print(f"\nPar: {stock1} vs {stock2}")
+                print(f"Score: {score:.4f}")
+                print(f"p-value: {p_value:.4f}")
+                is_cointegrated = p_value <= 0.05
+                if is_cointegrated:
+                    print("Conclusión: Series COINTEGRADAS (p ≤ 0.05) - Posible relación de largo plazo")
+                else:
+                    print("Conclusión: Series NO COINTEGRADAS (p > 0.05)")
+                cointegration_results.append((stock1, stock2, is_cointegrated, p_value))
+            else:
+                print(f"\n✗ Datos no disponibles para {stock1} o {stock2}")
+                cointegration_results.append((stock1, stock2, False, None))
+        except Exception as e:
+            print(f"\n✗ Error en prueba de cointegración para {stock1} vs {stock2}: {str(e)}")
+            cointegration_results.append((stock1, stock2, False, None))
+    
+    return cointegration_results
+
+def summarize_results(results, cointegration_results):
+    """Resumir resultados y realizar análisis comparativo"""
+    print("\n" + "="*60)
+    print("📊 RESUMEN DE RESULTADOS Y ANÁLISIS COMPARATIVO")
+    print("="*60)
+    
+    # Ordenar acciones por señal bajista (pendiente más negativa)
+    sorted_results = sorted(
+        results.items(),
+        key=lambda x: x[1]['slope'] if x[1]['slope'] != 0 else float('inf')
+    )
+    
+    # Resumen de resultados por acción
+    print("\n📋 Acciones con Potencial para Short Sale (Ordenadas por Señal Bajista):")
+    print("-"*80)
+    print(f"{'Acción':<10} {'Tendencia':<20} {'Recomendación':<40} {'Modelo':<10} {'MSE':<10} {'Pendiente':<12} {'Soporte/Res':<12} {'Stop-loss':<12}")
+    print("-"*80)
+    for ticker, result in sorted_results:
+        trend = result['trend']
+        recommendation = result['recommendation']
+        model = result['best_model']
+        mse = f"{result['best_mse']:.2f}" if result['best_mse'] != float('inf') else "N/A"
+        slope = f"{result['slope']:.6f}" if result['slope'] != 0 else "N/A"
+        support = f"${result['support_level']:.2f}" if result['support_level'] is not None else "N/A"
+        stop_loss = f"${result['stop_loss']:.2f}" if result['stop_loss'] is not None else "N/A"
+        print(f"{ticker:<10} {trend:<20} {recommendation:<40} {model:<10} {mse:<10} {slope:<12} {support:<12} {stop_loss:<12}")
+    
+    # Resumen de cointegración
+    print("\n📋 Resumen de Cointegración:")
+    print("-"*60)
+    print(f"{'Par':<20} {'Cointegrado':<12} {'p-value':<10}")
+    print("-"*60)
+    for stock1, stock2, is_cointegrated, p_value in cointegration_results:
+        pair = f"{stock1} vs {stock2}"
+        cointegrated = "Sí" if is_cointegrated else "No"
+        p_val = f"{p_value:.4f}" if p_value is not None else "N/A"
+        print(f"{pair:<20} {cointegrated:<12} {p_val:<10}")
+    
+    # Análisis comparativo
+    print("\n📈 Análisis Comparativo:")
+    print("-"*60)
+    
+    # Identificar acciones bajistas
+    bearish_stocks = [(ticker, r['slope'], r['trend_strength']) for ticker, r in results.items() if r['trend'] == 'BAJISTA']
+    if bearish_stocks:
+        best_bearish = min(bearish_stocks, key=lambda x: x[1])  # Menor pendiente (más bajista)
+        print(f"Mejor acción para SHORT SALE: {best_bearish[0]} (Pendiente: {best_bearish[1]:.6f}, Fuerza: {best_bearish[2]*100:.2f}%)")
+    else:
+        print("No hay acciones con tendencia BAJISTA clara para short sale.")
+    
+    # Identificar acciones alcistas (para contexto)
+    bullish_stocks = [(ticker, r['slope'], r['trend_strength']) for ticker, r in results.items() if r['trend'] == 'ALCISTA']
+    if bullish_stocks:
+        best_bullish = max(bullish_stocks, key=lambda x: x[1])
+        print(f"Mejor acción para COMPRA: {best_bullish[0]} (Pendiente: {best_bullish[1]:.6f}, Fuerza: {best_bullish[2]*100:.2f}%)")
+    else:
+        print("No hay acciones con tendencia ALCISTA clara para compra.")
+    
+    # Evaluación de riesgo y diversificación
+    print("\n📉 Evaluación de Riesgo y Diversificación:")
+    if bearish_stocks:
+        print("- Acciones BAJISTAS detectadas. Prioriza SHORT SALES en:")
+        for ticker, slope, strength in sorted(bearish_stocks, key=lambda x: x[1]):
+            print(f"  * {ticker}: Pendiente {slope:.6f}, Fuerza {strength*100:.2f}%")
+            print(f"    Riesgo: {results[ticker]['risk_note']}")
+    if bullish_stocks:
+        print("- Acciones ALCISTAS detectadas. Considera COMPRAS en:")
+        for ticker, slope, strength in bullish_stocks:
+            print(f"  * {ticker}: Pendiente {slope:.6f}, Fuerza {strength*100:.2f}%")
+    
+    # Revisar cointegración
+    cointegrated_pairs = [(s1, s2) for s1, s2, is_coint, _ in cointegration_results if is_coint]
+    if cointegrated_pairs:
+        print("- Se detectaron pares COINTEGRADOS:")
+        for s1, s2 in cointegrated_pairs:
+            print(f"  * {s1} vs {s2}: Evita combinar short sales/compras. Considera trading de pares.")
+    else:
+        print("- No se detectaron pares COINTEGRADOS. Las acciones son independientes.")
+    
+    # Recomendación general
+    print("\n🎯 Recomendación General:")
+    if bearish_stocks and not bullish_stocks:
+        print(f"El mercado muestra señales BAJISTAS. Prioriza SHORT SALES, especialmente en {best_bearish[0]}.")
+    elif bullish_stocks and not bearish_stocks:
+        print(f"El mercado muestra señales ALCISTAS. Prioriza COMPRAS, especialmente en {best_bullish[0]}.")
+    elif bearish_stocks and bullish_stocks:
+        print("El mercado es MIXTO. Considera una estrategia combinada:")
+        if bearish_stocks:
+            print(f"- SHORT SALE en {best_bearish[0]} (tendencia bajista más fuerte).")
+        if bullish_stocks:
+            print(f"- COMPRA en {best_bullish[0]} (tendencia alcista más fuerte).")
+    else:
+        print("El mercado es INCIERTO. ESPERA confirmación de tendencias claras.")
+    
+    if cointegrated_pairs:
+        print("Nota: Hay pares COINTEGRADOS. Explora trading de pares para aprovechar relaciones de largo plazo.")
+    
+    print("\n⚠️ Advertencia: Verifica niveles de soporte/resistencia y volumen antes de ejecutar operaciones.")
+
+def analyze_all_stocks():
+    """Analizar las 3 acciones, realizar prueba de cointegración y resumir resultados"""
+    stocks = [
+        {"ticker": "COST", "name": "Costco"},
+        {"ticker": "MRNA", "name": "Moderna"},
+        {"ticker": "NVDA", "name": "NVIDIA"}
+    ]
+    
+    print("\n" + "="*60)
+    print("📈 ANÁLISIS DE 3 ACCIONES - PREDICCIÓN DE TENDENCIA (5M 1D)")
+    print("="*60)
+    
+    data_dict = {}
+    results = {}
+    
+    for stock in stocks:
+        print(f"\n📌 INICIANDO ANÁLISIS PARA {stock['name']} ({stock['ticker']})")
+        analyzer = StockAnalyzer(stock['ticker'])
+        success = analyzer.full_analysis(stock['name'])
+        if success:
+            print(f"\n✓ Análisis completado para {stock['name']} ({stock['ticker']})")
+            data_dict[stock['ticker']] = analyzer.data
+            results[stock['ticker']] = {
+                'trend': analyzer.trend,
+                'recommendation': analyzer.recommendation,
+                'best_model': analyzer.best_model,
+                'best_mse': analyzer.best_mse,
+                'trend_strength': analyzer.trend_strength,
+                'is_stationary': analyzer.is_stationary,
+                'slope': analyzer.slope,
+                'support_level': analyzer.support_level,
+                'stop_loss': analyzer.stop_loss,
+                'risk_note': analyzer.risk_note
+            }
+        else:
+            print(f"\n✗ Análisis fallido para {stock['name']} ({stock['ticker']})")
+            results[stock['ticker']] = {
+                'trend': 'INDETERMINADA',
+                'recommendation': 'ANÁLISIS NO CONCLUYENTE',
+                'best_model': 'N/A',
+                'best_mse': float('inf'),
+                'trend_strength': 0.0,
+                'is_stationary': False,
+                'slope': 0.0,
+                'support_level': None,
+                'stop_loss': None,
+                'risk_note': 'Análisis fallido.'
+            }
+        print("\n" + "-"*60)
+    
+    # Prueba de cointegración
+    cointegration_results = []
+    if len(data_dict) >= 2:
+        cointegration_results = cointegration_test(data_dict)
+    else:
+        print("\n✗ No hay suficientes datos para prueba de cointegración")
+    
+    # Resumen y análisis comparativo
+    summarize_results(results, cointegration_results)
+    
+    print("\n" + "="*60)
+    print("🏁 ANÁLISIS COMPLETO FINALIZADO PARA TODAS LAS ACCIONES")
+    print("="*60)
+
+if __name__ == "__main__":
+    analyze_all_stocks()
